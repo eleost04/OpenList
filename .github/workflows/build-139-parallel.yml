@@ -1,0 +1,102 @@
+name: build-139-parallel
+
+# Builds the linux/amd64 image for the 139-parallel-upload branch (upstream release + the 139Yun
+# concurrent-upload patch in drivers/139) and pushes it to ghcr.io/<owner>/openlist.
+
+on:
+  push:
+    branches: [139-parallel-upload]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-139-parallel
+  cancel-in-progress: false
+
+env:
+  # Upstream release this branch is based on; bump it together with the rebase.
+  UPSTREAM_VERSION: v4.2.9
+  IMAGE: ghcr.io/${{ github.repository_owner }}/openlist
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version info
+        id: v
+        run: |
+          echo "sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "built=$(date -u '+%Y-%m-%d %H:%M:%S +0000')" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch official frontend ${{ env.UPSTREAM_VERSION }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$UPSTREAM_VERSION" -R OpenListTeam/OpenList-Frontend \
+            -p "openlist-frontend-dist-$UPSTREAM_VERSION.tar.gz" -O dist.tar.gz
+          rm -rf public/dist && mkdir -p public/dist
+          tar -xzf dist.tar.gz -C public/dist && rm dist.tar.gz
+          test -f public/dist/index.html
+
+      - name: Test 139 driver and build static binary
+        env:
+          VERSION: ${{ env.UPSTREAM_VERSION }}-139par-${{ steps.v.outputs.sha }}
+          COMMIT: ${{ steps.v.outputs.sha }}
+          BUILT: ${{ steps.v.outputs.built }}
+        run: |
+          mkdir -p build/linux/amd64
+          docker run --rm -v "$PWD":/src -w /src \
+            -e GOTOOLCHAIN=auto -e VERSION -e COMMIT -e BUILT -e WEB="$UPSTREAM_VERSION" \
+            golang:1.27-alpine sh -euc '
+              apk add -q --no-cache gcc musl-dev git
+              go test -count=1 ./drivers/139/
+              P=github.com/OpenListTeam/OpenList/v4/internal/conf
+              CGO_LDFLAGS=-static go build -buildvcs=false -tags=jsoniter -o build/linux/amd64/openlist \
+                -ldflags="-w -s -linkmode external -extldflags \"-static -fpic\" \
+                  -X \"$P.BuiltAt=$BUILT\" -X $P.GitAuthor=eleost04 -X $P.GitCommit=$COMMIT \
+                  -X $P.Version=$VERSION -X $P.WebVersion=$WEB" .
+              ./build/linux/amd64/openlist version'
+          file build/linux/amd64/openlist | grep -q 'statically linked'
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ci
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:139-latest
+            ${{ env.IMAGE }}:${{ env.UPSTREAM_VERSION }}-139-${{ steps.v.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.UPSTREAM_VERSION }}-139par-${{ steps.v.outputs.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0
+            org.opencontainers.image.description=OpenList ${{ env.UPSTREAM_VERSION }} with concurrent 139Yun (personal_new) uploads
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image"
+            echo '```'
+            echo "${IMAGE}:${UPSTREAM_VERSION}-139-${{ steps.v.outputs.sha }}"
+            echo "${IMAGE}@${{ steps.push.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

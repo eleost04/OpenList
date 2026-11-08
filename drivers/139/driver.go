@@ -674,6 +674,11 @@ func (d *Yun139) Remove(ctx context.Context, obj model.Obj) error {
 	}
 }
 
+// useParallelUpload reports whether parts are uploaded concurrently (personal_new with upload_thread > 1).
+func (d *Yun139) useParallelUpload() bool {
+	return d.Addition.Type == MetaPersonalNew && d.UploadThread > 1
+}
+
 func (d *Yun139) getPartSize(size int64) int64 {
 	if d.CustomUploadPartSize != 0 {
 		return d.CustomUploadPartSize
@@ -706,16 +711,33 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 		}
 
 		var err error
-		fullHash := stream.GetHash().GetHash(utils.SHA256)
-		if len(fullHash) != utils.SHA256.Width {
-			_, fullHash, err = streamPkg.CacheFullAndHash(stream, &up, utils.SHA256)
+		size := stream.GetSize()
+		partSize := d.getPartSize(size)
+		usePar := d.useParallelUpload()
+		var parParts []parPartInfo
+		var parFile io.ReaderAt
+		var fullHash string
+		if usePar {
+			tmpF, err := stream.CacheFullAndWriter(nil, nil)
 			if err != nil {
 				return err
 			}
+			parFile = tmpF
+			hashUp := model.UpdateProgressWithRange(up, 0, 50)
+			up = model.UpdateProgressWithRange(up, 50, 100)
+			fullHash, parParts, err = planParallelParts(tmpF, size, partSize, hashUp)
+			if err != nil {
+				return err
+			}
+		} else {
+			fullHash = stream.GetHash().GetHash(utils.SHA256)
+			if len(fullHash) != utils.SHA256.Width {
+				_, fullHash, err = streamPkg.CacheFullAndHash(stream, &up, utils.SHA256)
+				if err != nil {
+					return err
+				}
+			}
 		}
-
-		size := stream.GetSize()
-		partSize := d.getPartSize(size)
 		part := int64(1)
 		if size > partSize {
 			part = (size + partSize - 1) / partSize
@@ -740,6 +762,13 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 			partInfos = append(partInfos, partInfo)
 		}
 
+		apiParts := func(i, j int) any {
+			if usePar {
+				return parParts[i:j]
+			}
+			return partInfos[i:j]
+		}
+
 		// 筛选出前 100 个 partInfos
 		firstPartInfos := partInfos
 		if len(firstPartInfos) > 100 {
@@ -751,8 +780,8 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 			"contentHash":          fullHash,
 			"contentHashAlgorithm": "SHA256",
 			"contentType":          "application/octet-stream",
-			"parallelUpload":       false,
-			"partInfos":            firstPartInfos,
+			"parallelUpload":       usePar,
+			"partInfos":            apiParts(0, len(firstPartInfos)),
 			"size":                 size,
 			"parentFileId":         dstDir.GetID(),
 			"name":                 stream.GetName(),
@@ -792,43 +821,57 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 			// Progress
 			p := driver.NewProgress(size, up)
 
-			rateLimited := driver.NewLimitedUploadStream(ctx, stream)
-			ss, err := streamPkg.NewStreamSectionReader(&streamPkg.FileStream{
-				Ctx:    ctx,
-				Reader: rateLimited,
-				Obj:    &model.Object{Size: size},
-			}, int(partSize), &up)
+			var ss streamPkg.StreamSectionReader
+			if !usePar { // parallel mode reads parts straight from parFile
+				rateLimited := driver.NewLimitedUploadStream(ctx, stream)
+				ss, err = streamPkg.NewStreamSectionReader(&streamPkg.FileStream{
+					Ctx:    ctx,
+					Reader: rateLimited,
+					Obj:    &model.Object{Size: size},
+				}, int(partSize), &up)
+			}
 			if err != nil {
 				return err
 			}
 
-			// 先上传前100个分片
-			err = d.uploadPersonalParts(ctx, partInfos, resp.Data.PartInfos, ss, p)
-			if err != nil {
-				return err
-			}
-
-			// 如果还有剩余分片，分批获取上传地址并上传
-			for i := 100; i < len(partInfos); i += 100 {
-				end := min(i+100, len(partInfos))
-				batchPartInfos := partInfos[i:end]
+			fetchMore := func(i, end int) ([]PersonalPartInfo, error) {
 				moredata := base.Json{
 					"fileId":    resp.Data.FileId,
 					"uploadId":  resp.Data.UploadId,
-					"partInfos": batchPartInfos,
+					"partInfos": apiParts(i, end),
 					"commonAccountInfo": base.Json{
 						"account":     d.getAccount(),
 						"accountType": 1,
 					},
 				}
 				var moreresp PersonalUploadUrlResp
-				_, err = d.newPost(getUploadUrlPath, moredata, &moreresp)
+				if _, err := d.newPost(getUploadUrlPath, moredata, &moreresp); err != nil {
+					return nil, err
+				}
+				return moreresp.Data.PartInfos, nil
+			}
+
+			if usePar {
+				err = d.uploadPartsPipelined(ctx, partInfos, resp.Data.PartInfos, fetchMore, parFile, p)
 				if err != nil {
 					return err
 				}
-				err = d.uploadPersonalParts(ctx, partInfos, moreresp.Data.PartInfos, ss, p)
+			} else {
+				// 先上传前100个分片
+				err = d.uploadPersonalParts(ctx, partInfos, resp.Data.PartInfos, ss, p)
 				if err != nil {
 					return err
+				}
+				// 如果还有剩余分片，分批获取上传地址并上传
+				for i := 100; i < len(partInfos); i += 100 {
+					more, err := fetchMore(i, min(i+100, len(partInfos)))
+					if err != nil {
+						return err
+					}
+					err = d.uploadPersonalParts(ctx, partInfos, more, ss, p)
+					if err != nil {
+						return err
+					}
 				}
 			}
 

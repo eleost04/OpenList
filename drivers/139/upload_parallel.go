@@ -151,13 +151,28 @@ var (
 	errLostRace    = errors.New("part already uploaded by another connection")
 )
 
-const (
-	// Slow connections show up from the first seconds (mostly the first wave of parts: 0.25-1.3 MB/s
-	// while healthy ones run 10-35 MB/s), so check often and give up on them early.
-	stallTick    = 2 * time.Second
-	stallWindow  = 8 * time.Second
-	stallMinRate = 2 << 20 // bytes/s averaged over stallWindow; below this the connection is dropped and retried
+// stallPolicy: the watchdog drops a connection when fewer than minBytes were read during the last
+// window while unsent data remains.
+type stallPolicy struct {
+	window   time.Duration
+	minBytes int64
+}
 
+// vars (not consts) so tests can shrink them.
+var (
+	stallTick = 2 * time.Second
+	// strictStall replaces slow connections early (the first wave of parts often runs at 0.25-1.3 MB/s
+	// while healthy ones run 10-35 MB/s). Used for the first strictAttempts tries of a part and for
+	// hedges. A strict kill only means "slow", so it does not count as a failure.
+	strictStall = stallPolicy{window: 8 * time.Second, minBytes: 16 << 20} // < 2 MB/s
+	// relaxedStall only catches connections that stopped moving entirely. Later tries use it, so a
+	// part that is merely slow on a congested link still completes instead of failing the upload.
+	relaxedStall = stallPolicy{window: 60 * time.Second, minBytes: 1}
+)
+
+const (
+	strictAttempts = 2
+	// primaryAttempts counts real failures only (HTTP/network errors and relaxed-policy stalls).
 	primaryAttempts = 5
 	// Tail hedging: once every part has been handed out, idle workers re-upload the oldest in-flight
 	// part that has run at least hedgeMinAge and still has >= 1/hedgeMinRemainDiv of its bytes unread,
@@ -168,13 +183,15 @@ const (
 )
 
 // putPart PUTs one part. sent is reset and then tracks bytes read from rd. A watchdog cancels the
-// attempt if fewer than stallWindow*stallMinRate bytes were read in the last window while unsent data remains.
-func putPart(ctx context.Context, url string, rd io.Reader, size int64, counter io.Writer, sent *atomic.Int64) error {
+// attempt (errPartStalled) when the stall policy is violated while unsent data remains.
+func putPart(ctx context.Context, url string, rd io.Reader, size int64, counter io.Writer, sent *atomic.Int64, sp stallPolicy) error {
 	actx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	sent.Store(0)
+	tick := stallTick // read before the watchdog starts: it may outlive this call briefly
+	w := max(int(sp.window/tick), 1)
 	go func() {
-		t := time.NewTicker(stallTick)
+		t := time.NewTicker(tick)
 		defer t.Stop()
 		hist := []int64{0}
 		for {
@@ -184,11 +201,10 @@ func putPart(ctx context.Context, url string, rd io.Reader, size int64, counter 
 			case <-t.C:
 				cur := sent.Load()
 				hist = append(hist, cur)
-				w := int(stallWindow / stallTick)
 				if cur >= size || len(hist) <= w {
 					continue
 				}
-				if cur-hist[len(hist)-1-w] < int64(stallWindow/time.Second)*stallMinRate {
+				if cur-hist[len(hist)-1-w] < sp.minBytes {
 					cancel(errPartStalled)
 					return
 				}
@@ -261,7 +277,7 @@ func (j *partJob) markDone() {
 
 // attempt runs one PUT of the part on its own cancelable context. It returns errLostRace if the
 // part was completed by another connection meanwhile.
-func (j *partJob) attempt(ctx context.Context, file io.ReaderAt, counter io.Writer, sent *atomic.Int64) error {
+func (j *partJob) attempt(ctx context.Context, file io.ReaderAt, counter io.Writer, sent *atomic.Int64, sp stallPolicy) error {
 	actx, cancel := context.WithCancelCause(ctx)
 	j.mu.Lock()
 	if j.isDone() {
@@ -279,7 +295,7 @@ func (j *partJob) attempt(ctx context.Context, file io.ReaderAt, counter io.Writ
 		j.mu.Unlock()
 		cancel(nil)
 	}()
-	err := putPart(actx, j.url, io.NewSectionReader(file, j.part.ParallelHashCtx.PartOffset, j.part.PartSize), j.part.PartSize, counter, sent)
+	err := putPart(actx, j.url, io.NewSectionReader(file, j.part.ParallelHashCtx.PartOffset, j.part.PartSize), j.part.PartSize, counter, sent, sp)
 	if err == nil {
 		j.markDone()
 		return nil
@@ -312,9 +328,14 @@ func (d *Yun139) uploadPartsPipelined(ctx context.Context, partInfos []PartInfo,
 
 	runPrimary := func(j *partJob) error {
 		var err error
-		for attempt := 1; attempt <= primaryAttempts; attempt++ {
+		fails := 0
+		for attempt := 1; fails < primaryAttempts; attempt++ {
 			if j.isDone() {
 				return nil
+			}
+			sp := relaxedStall
+			if attempt <= strictAttempts {
+				sp = strictStall
 			}
 			if attempt > 1 {
 				// A hedge already sending this part makes a parallel retry pointless: wait for its outcome.
@@ -334,13 +355,13 @@ func (d *Yun139) uploadPartsPipelined(ctx context.Context, partInfos []PartInfo,
 				select {
 				case <-gctx.Done():
 					return context.Cause(gctx)
-				case <-time.After(time.Second << (attempt - 2)):
+				case <-time.After(time.Second << min(fails, 4)):
 				}
 			}
 			j.counter.reset()
 			j.started.Store(time.Now().UnixNano())
 			t := time.Now()
-			err = j.attempt(gctx, file, j.counter, &j.sent)
+			err = j.attempt(gctx, file, j.counter, &j.sent, sp)
 			j.started.Store(0)
 			dur := time.Since(t)
 			switch {
@@ -355,7 +376,12 @@ func (d *Yun139) uploadPartsPipelined(ctx context.Context, partInfos []PartInfo,
 			case gctx.Err() != nil:
 				return context.Cause(gctx)
 			}
-			log.Warnf("[139] part %d/%d attempt %d failed after %s: %v", j.pn, total, attempt, dur.Round(time.Millisecond), err)
+			if sp == strictStall && errors.Is(err, errPartStalled) {
+				log.Infof("[139] part %d/%d attempt %d too slow after %s, reconnecting: %v", j.pn, total, attempt, dur.Round(time.Millisecond), err)
+				continue
+			}
+			fails++
+			log.Warnf("[139] part %d/%d attempt %d failed (%d/%d) after %s: %v", j.pn, total, attempt, fails, primaryAttempts, dur.Round(time.Millisecond), err)
 		}
 		// Out of retries; a hedge may still be sending this part.
 		j.mu.Lock()
@@ -430,7 +456,7 @@ func (d *Yun139) uploadPartsPipelined(ctx context.Context, partInfos []PartInfo,
 			}
 			left := j.part.PartSize - j.sent.Load()
 			t := time.Now()
-			err := j.attempt(gctx, file, io.Discard, &sent)
+			err := j.attempt(gctx, file, io.Discard, &sent, strictStall)
 			close(j.hedgeEnd)
 			dur := time.Since(t).Round(time.Millisecond)
 			switch {

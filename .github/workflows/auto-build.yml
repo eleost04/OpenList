@@ -1,0 +1,178 @@
+name: auto-build
+
+# Daily: if upstream OpenList has a new release, or the 139-parallel-upload branch has new
+# drivers/139 commits, cherry-pick those commits onto the upstream release, test, build the
+# linux/amd64 image, push it to ghcr.io/<owner>/openlist and record it in latest.env.
+# A conflict or failing test fails the run (GitHub emails the owner); nothing is pushed then.
+
+on:
+  schedule:
+    - cron: '30 19 * * *' # 03:30 Asia/Shanghai
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if upstream and patch are unchanged
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: auto-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: OpenListTeam/OpenList
+  FRONTEND: OpenListTeam/OpenList-Frontend
+  PATCH_BRANCH: 139-parallel-upload
+  PATCH_PATH: drivers/139
+  IMAGE: ghcr.io/${{ github.repository_owner }}/openlist
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ci branch
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Decide whether to build
+        id: d
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          . ci/latest.env
+          tag=$(gh release view -R "$UPSTREAM" --json tagName -q .tagName) # latest non-prerelease
+          git init -q src && cd src
+          git fetch -q --filter=blob:none "https://github.com/$GITHUB_REPOSITORY.git" \
+            "+refs/heads/$PATCH_BRANCH:refs/remotes/me/patch"
+          git fetch -q --filter=blob:none "https://github.com/$UPSTREAM.git" \
+            "+refs/heads/main:refs/remotes/up/main" "+refs/tags/*:refs/tags/*"
+          patch=$(git log -1 --format=%H me/patch -- "$PATCH_PATH")
+          # the patch = commits on the branch that are not upstream and touch drivers/139
+          commits=$(git log --reverse --format=%H me/patch --not up/main --tags -- "$PATCH_PATH" | tr '\n' ' ')
+          echo "upstream: $UPSTREAM_VERSION -> $tag | patch: ${PATCH_SHA:0:7} -> ${patch:0:7} | commits: $commits"
+          [ -n "$commits" ] || { echo "::error::no patch commits found on $PATCH_BRANCH"; exit 1; }
+          build=false
+          if [ "$tag" != "$UPSTREAM_VERSION" ] || [ "$patch" != "$PATCH_SHA" ] || [ "$FORCE" = true ]; then build=true; fi
+          {
+            echo "build=$build"; echo "tag=$tag"; echo "patch=$patch"; echo "short=${patch:0:7}"
+            echo "commits=$commits"; echo "built=$(date -u '+%Y-%m-%d %H:%M:%S +0000')"
+          } >> "$GITHUB_OUTPUT"
+          [ "$build" = true ] || echo "Up to date ($tag, patch ${patch:0:7})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply patch onto ${{ steps.d.outputs.tag }}
+        if: steps.d.outputs.build == 'true'
+        working-directory: src
+        env:
+          TAG: ${{ steps.d.outputs.tag }}
+          COMMITS: ${{ steps.d.outputs.commits }}
+        run: |
+          set -euo pipefail
+          git config user.name github-actions; git config user.email github-actions@users.noreply.github.com
+          git checkout -q -b build "refs/tags/$TAG"
+          if ! git cherry-pick $COMMITS; then
+            git status --short | head -30
+            echo "::error::139 patch does not apply cleanly onto $TAG; rebase $PATCH_BRANCH manually"
+            exit 1
+          fi
+          git log --oneline -$(( $(echo $COMMITS | wc -w) + 1 ))
+
+      - name: Fetch official frontend ${{ steps.d.outputs.tag }}
+        if: steps.d.outputs.build == 'true'
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.d.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$FRONTEND" -p "openlist-frontend-dist-$TAG.tar.gz" -O dist.tar.gz \
+            || { echo "::error::frontend release $TAG not published yet; will retry next run"; exit 1; }
+          rm -rf public/dist && mkdir -p public/dist
+          tar -xzf dist.tar.gz -C public/dist && rm dist.tar.gz
+          test -f public/dist/index.html
+
+      - name: Test 139 driver and build static binary
+        if: steps.d.outputs.build == 'true'
+        working-directory: src
+        env:
+          VERSION: ${{ steps.d.outputs.tag }}-139par-${{ steps.d.outputs.short }}
+          COMMIT: ${{ steps.d.outputs.short }}
+          BUILT: ${{ steps.d.outputs.built }}
+          WEB: ${{ steps.d.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/linux/amd64
+          docker run --rm -v "$PWD":/src -w /src \
+            -e GOTOOLCHAIN=auto -e VERSION -e COMMIT -e BUILT -e WEB \
+            golang:alpine sh -euc '
+              apk add -q --no-cache gcc musl-dev git
+              go vet ./drivers/139/
+              go test -count=1 ./drivers/139/
+              P=github.com/OpenListTeam/OpenList/v4/internal/conf
+              CGO_LDFLAGS=-static go build -buildvcs=false -tags=jsoniter -o build/linux/amd64/openlist \
+                -ldflags="-w -s -linkmode external -extldflags \"-static -fpic\" \
+                  -X \"$P.BuiltAt=$BUILT\" -X $P.GitAuthor=eleost04 -X $P.GitCommit=$COMMIT \
+                  -X $P.Version=$VERSION -X $P.WebVersion=$WEB" .
+              ./build/linux/amd64/openlist version'
+          file build/linux/amd64/openlist | grep -q 'statically linked'
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.d.outputs.build == 'true'
+
+      - uses: docker/login-action@v3
+        if: steps.d.outputs.build == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        if: steps.d.outputs.build == 'true'
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: src/Dockerfile.ci
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:139-latest
+            ${{ env.IMAGE }}:${{ steps.d.outputs.tag }}-139-${{ steps.d.outputs.short }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.d.outputs.patch }}
+            org.opencontainers.image.version=${{ steps.d.outputs.tag }}-139par-${{ steps.d.outputs.short }}
+            org.opencontainers.image.licenses=AGPL-3.0
+            org.opencontainers.image.description=OpenList ${{ steps.d.outputs.tag }} with concurrent 139Yun (personal_new) uploads
+
+      - name: Record build in latest.env
+        if: steps.d.outputs.build == 'true'
+        working-directory: ci
+        env:
+          TAG: ${{ steps.d.outputs.tag }}
+          PATCH: ${{ steps.d.outputs.patch }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          BUILT: ${{ steps.d.outputs.built }}
+        run: |
+          set -euo pipefail
+          cat > latest.env <<EOF
+          UPSTREAM_VERSION=$TAG
+          PATCH_SHA=$PATCH
+          IMAGE=$IMAGE@$DIGEST
+          BUILT='$BUILT'
+          EOF
+          git config user.name github-actions; git config user.email github-actions@users.noreply.github.com
+          git add latest.env
+          git commit -q -m "build $TAG + 139 patch ${PATCH:0:7}"
+          git push -q origin HEAD
+          {
+            echo "### Built $TAG + 139 patch ${PATCH:0:7}"
+            echo '```'; cat latest.env; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
